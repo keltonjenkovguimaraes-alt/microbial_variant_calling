@@ -1,0 +1,2 @@
+sample	fastq1	fastq2
+SRR7801919	data/raw/SRR7801919_1.fastq.gz	data/raw/SRR7801919_2.fastq.gz

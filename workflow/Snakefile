@@ -1,0 +1,565 @@
+"""
+SNP-SVant: A workflow for SNP and Structural Variant calling
+in organisms without benchmarked variant datasets.
+
+Based on: Gunasekaran, D., Ardell, D. H., & Nobile, C. J. (2024).
+SNP-SVant: A computational workflow to predict and annotate genomic
+variants in organisms lacking benchmarked variants.
+Current Protocols, 4, e1046.
+"""
+
+# Load configuration
+configfile: "config/config.yaml"
+
+# Import sample information
+import pandas as pd
+samples_df = pd.read_csv(config["sample_metadata"], sep="\t", comment="#")
+SAMPLES = samples_df["sample"].tolist()
+
+# Define wildcard constraints
+wildcard_constraints:
+    sample="|".join(SAMPLES)
+
+
+# ============================================================
+# Target: All final outputs
+# ============================================================
+rule all:
+    input:
+        # QC outputs
+        expand("results/qc/raw/{sample}_1_fastqc.html", sample=SAMPLES),
+        expand("results/qc/raw/{sample}_2_fastqc.html", sample=SAMPLES),
+        "results/qc/multiqc_report.html",
+        # Alignment outputs
+        expand("results/alignment/{sample}.dedup.bam", sample=SAMPLES),
+        expand("results/alignment/{sample}.dedup.bam.bai", sample=SAMPLES),
+        # First pass variants
+        expand("results/variants/first_pass/{sample}.filtered.vcf.gz", sample=SAMPLES),
+        # BQSR outputs
+        expand("results/bqsr/{sample}.recal.table", sample=SAMPLES),
+        expand("results/alignment/{sample}.recal.bam", sample=SAMPLES),
+        # Final variants
+        expand("results/variants/final/{sample}.filtered_snps_final.vcf.gz", sample=SAMPLES),
+        expand("results/visualization/{sample}_summary.txt", sample=SAMPLES),
+        expand("results/variants/final/{sample}.filtered_indels_final.vcf.gz", sample=SAMPLES),
+        # Alignment statistics
+        expand("results/alignment/{sample}.alignment_metrics.txt", sample=SAMPLES),
+        # Variant annotation
+        expand("results/annotation/{sample}_snps_vep.txt", sample=SAMPLES),
+
+
+# ============================================================
+# Quality Control
+# ============================================================
+rule fastqc_raw:
+    """
+    Run FastQC on raw sequencing reads to assess quality
+    """
+    input:
+        r1 = "data/raw/{sample}_1.fastq.gz",
+        r2 = "data/raw/{sample}_2.fastq.gz"
+    output:
+        html_r1 = "results/qc/raw/{sample}_1_fastqc.html",
+        html_r2 = "results/qc/raw/{sample}_2_fastqc.html",
+        zip_r1 = "results/qc/raw/{sample}_1_fastqc.zip",
+        zip_r2 = "results/qc/raw/{sample}_2_fastqc.zip"
+    threads: 2
+    shell:
+        """
+        fastqc -t {threads} -o results/qc/raw/ {input.r1} {input.r2}
+        """
+
+
+rule multiqc:
+    """
+    Aggregate FastQC reports into a single MultiQC report
+    """
+    input:
+        expand("results/qc/raw/{sample}_R{rp}_fastqc.zip",
+               sample=SAMPLES, rp=["1", "2"])
+    output:
+        "results/qc/multiqc_report.html"
+    shell:
+        """
+        multiqc results/qc/raw/ -o results/qc/ --force
+        """
+
+
+# ============================================================
+# Reference Genome Indexing
+# ============================================================
+rule build_bowtie2_index:
+    """
+    Build Bowtie2 index for reference genome alignment
+    """
+    input:
+        "data/reference/reference.fasta"
+    output:
+        "data/reference/reference.fasta.1.bt2"
+    shell:
+        """
+        bowtie2-build {input} data/reference/reference.fasta
+        """
+
+
+rule index_fasta:
+    """
+    Index reference FASTA for GATK and IGV
+    """
+    input:
+        "data/reference/reference.fasta"
+    output:
+        "data/reference/reference.fasta.fai"
+    shell:
+        """
+        samtools faidx {input}
+        """
+
+
+rule create_sequence_dict:
+    """
+    Create sequence dictionary for GATK
+    """
+    input:
+        "data/reference/reference.fasta"
+    output:
+        "data/reference/reference.dict"
+    shell:
+        """
+        gatk CreateSequenceDictionary -R {input} -O {output}
+        """
+
+
+# ============================================================
+# Read Alignment
+# ============================================================
+rule map_reads:
+    """
+    Align paired-end reads to reference genome using Bowtie2
+    """
+    input:
+        r1 = "data/raw/{sample}_1.fastq.gz",
+        r2 = "data/raw/{sample}_2.fastq.gz",
+        index = "data/reference/reference.fasta.1.bt2"
+    output:
+        sam = "results/alignment/{sample}.sam",
+        log = "results/alignment/{sample}_bowtie2.log"
+    threads: 8
+    params:
+        # Read group information for GATK compatibility
+        rg = "@RG\\tID:{sample}\\tSM:{sample}\\tLB:lib1\\tPL:ILLUMINA"
+    shell:
+        """
+        bowtie2 -x data/reference/reference.fasta \
+                -1 {input.r1} -2 {input.r2} \
+                --rg-id {wildcards.sample} \
+                --rg "SM:{wildcards.sample}" \
+                --rg "PL:ILLUMINA" \
+                --rg "LB:lib1" \
+                --very-sensitive-local \
+                -p {threads} \
+                -S {output.sam} 2> {output.log}
+        """
+
+
+rule sort_bam:
+    """
+    Sort SAM file and convert to BAM format
+    """
+    input:
+        "results/alignment/{sample}.sam"
+    output:
+        "results/alignment/{sample}.sorted.bam"
+    threads: 4
+    shell:
+        """
+        samtools sort -@ {threads} -o {output} {input}
+        """
+
+
+rule mark_duplicates:
+    """
+    Mark PCR duplicates using Picard
+    Note: Duplicates are marked (flag 0x400), not removed
+    """
+    input:
+        "results/alignment/{sample}.sorted.bam"
+    output:
+        bam = "results/alignment/{sample}.dedup.bam",
+        bai = "results/alignment/{sample}.dedup.bam.bai",
+        metrics = "results/alignment/{sample}.dedup_metrics.txt"
+    shell:
+        """
+        picard MarkDuplicates \
+            I={input} \
+            O={output.bam} \
+            M={output.metrics} \
+            CREATE_INDEX=true \
+            VALIDATION_STRINGENCY=SILENT && \
+        mv {output.bam}.bai {output.bai} 2>/dev/null || mv {output.bam}.bai.replace_me {output.bai} 2>/dev/null || samtools index {output.bam} {output.bai}
+        """
+
+
+rule alignment_metrics:
+    """
+    Collect alignment summary statistics
+    """
+    input:
+        bam = "results/alignment/{sample}.dedup.bam",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/alignment/{sample}.alignment_metrics.txt"
+    shell:
+        """
+        picard CollectAlignmentSummaryMetrics \
+            R={input.ref} \
+            I={input.bam} \
+            O={output}
+        samtools flagstat {input.bam} >> {output}
+        """
+
+
+# ============================================================
+# First Pass Variant Calling (Before BQSR)
+# ============================================================
+rule first_pass_haplotypecaller:
+    """
+    First round of variant calling with HaplotypeCaller
+    Generates GVCF for each sample
+    """
+    input:
+        bam = "results/alignment/{sample}.dedup.bam",
+        bai = "results/alignment/{sample}.dedup.bam.bai",
+        ref = "data/reference/reference.fasta",
+        ref_dict = "data/reference/reference.dict",
+        ref_index = "data/reference/reference.fasta.fai"
+    output:
+        "results/variants/first_pass/{sample}.g.vcf.gz"
+    threads: 4
+    shell:
+        """
+        gatk HaplotypeCaller \
+            -R {input.ref} \
+            -I {input.bam} \
+            -O {output} \
+            -ERC GVCF \
+            --native-pair-hmm-threads {threads} \
+            --sample-name {wildcards.sample}
+        """
+
+
+rule first_pass_genotype:
+    """
+    Genotype GVCFs from first pass
+    """
+    input:
+        gvcf = "results/variants/first_pass/{sample}.g.vcf.gz",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/first_pass/{sample}.vcf.gz"
+    shell:
+        """
+        gatk GenotypeGVCFs \
+            -R {input.ref} \
+            -V {input.gvcf} \
+            -O {output}
+        """
+
+
+rule first_pass_filter_snps:
+    """
+    Filter SNPs from first pass using GATK recommended thresholds
+    These high-quality variants serve as the "pseudo-truth" for BQSR
+    """
+    input:
+        vcf = "results/variants/first_pass/{sample}.vcf.gz",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/first_pass/{sample}.filtered.vcf.gz"
+    params:
+        # GATK hard-filtering expressions
+        filter_exp = "--filter-expression 'QD < 2.0' --filter-name 'QD' --filter-expression 'FS > 60.0' --filter-name 'FS' --filter-expression 'SOR > 4.0' --filter-name 'SOR' --filter-expression 'MQ < 40.0' --filter-name 'MQ' --filter-expression 'MQRankSum < -12.5' --filter-name 'MQRankSum' --filter-expression 'ReadPosRankSum < -8.0' --filter-name 'ReadPosRankSum'"
+    shell:
+        """
+        gatk SelectVariants \
+            -R {input.ref} \
+            -V {input.vcf} \
+            --select-type-to-include SNP \
+            -O snps_raw.vcf.gz
+        
+        gatk VariantFiltration \
+            -R {input.ref} \
+            -V snps_raw.vcf.gz \
+            {params.filter_exp} \
+            -O snps_filtered.vcf.gz
+        
+        # Keep only PASS variants
+        bcftools view -f PASS snps_filtered.vcf.gz -Oz -o {output}
+        tabix -p vcf {output}
+        
+        # Cleanup temporary files
+        rm snps_raw.vcf.gz snps_raw.vcf.gz.tbi snps_filtered.vcf.gz snps_filtered.vcf.gz.tbi 2>/dev/null || true
+        """
+
+
+# ============================================================
+# Base Quality Score Recalibration (BQSR)
+# ============================================================
+rule base_recalibration:
+    """
+    Perform BQSR using high-confidence variants from first pass
+    This is the KEY INNOVATION: bootstrapping without benchmarked variants
+    """
+    input:
+        bam = "results/alignment/{sample}.dedup.bam",
+        ref = "data/reference/reference.fasta",
+        known_variants = "results/variants/first_pass/{sample}.filtered.vcf.gz"
+    output:
+        "results/bqsr/{sample}.recal.table"
+    shell:
+        """
+        gatk BaseRecalibrator \
+            -R {input.ref} \
+            -I {input.bam} \
+            --known-sites {input.known_variants} \
+            -O {output}
+        """
+
+
+rule apply_bqsr:
+    """
+    Apply BQSR to aligned reads
+    """
+    input:
+        bam = "results/alignment/{sample}.dedup.bam",
+        ref = "data/reference/reference.fasta",
+        recal_table = "results/bqsr/{sample}.recal.table"
+    output:
+        "results/alignment/{sample}.recal.bam"
+    shell:
+        """
+        gatk ApplyBQSR \
+            -R {input.ref} \
+            -I {input.bam} \
+            --bqsr-recal-file {input.recal_table} \
+            -O {output}
+        """
+
+
+rule second_base_recalibration:
+    """
+    Second round of BQSR for additional accuracy
+    """
+    input:
+        bam = "results/alignment/{sample}.recal.bam",
+        ref = "data/reference/reference.fasta",
+        known_variants = "results/variants/first_pass/{sample}.filtered.vcf.gz"
+    output:
+        "results/bqsr/{sample}.recal2.table"
+    shell:
+        """
+        gatk BaseRecalibrator \
+            -R {input.ref} \
+            -I {input.bam} \
+            --known-sites {input.known_variants} \
+            -O {output}
+        """
+
+
+rule apply_second_bqsr:
+    """
+    Apply second round of BQSR
+    """
+    input:
+        bam = "results/alignment/{sample}.dedup.bam",
+        ref = "data/reference/reference.fasta",
+        recal_table = "results/bqsr/{sample}.recal2.table"
+    output:
+        "results/alignment/{sample}.final.bam"
+    shell:
+        """
+        gatk ApplyBQSR \
+            -R {input.ref} \
+            -I {input.bam} \
+            --bqsr-recal-file {input.recal_table} \
+            -O {output}
+        """
+
+
+# ============================================================
+# Final Variant Calling (After BQSR)
+# ============================================================
+rule final_haplotypecaller:
+    """
+    Final variant calling using BQSR-recalibrated reads
+    """
+    input:
+        bam = "results/alignment/{sample}.final.bam",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/final/{sample}.g.vcf.gz"
+    threads: 4
+    shell:
+        """
+        gatk HaplotypeCaller \
+            -R {input.ref} \
+            -I {input.bam} \
+            -O {output} \
+            -ERC GVCF \
+            --native-pair-hmm-threads {threads}
+        """
+
+
+rule final_genotype:
+    """
+    Genotype final GVCFs
+    """
+    input:
+        gvcf = "results/variants/final/{sample}.g.vcf.gz",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/final/{sample}.vcf.gz"
+    shell:
+        """
+        gatk GenotypeGVCFs \
+            -R {input.ref} \
+            -V {input.gvcf} \
+            -O {output}
+        """
+
+
+rule final_filter_snps:
+    """
+    Final filtering of SNPs
+    """
+    input:
+        vcf = "results/variants/final/{sample}.vcf.gz",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/final/{sample}.filtered_snps_final.vcf.gz"
+    params:
+        filter_exp = "--filter-expression 'QD < 2.0' --filter-name 'QD' --filter-expression 'FS > 60.0' --filter-name 'FS' --filter-expression 'SOR > 4.0' --filter-name 'SOR' --filter-expression 'MQ < 40.0' --filter-name 'MQ' --filter-expression 'MQRankSum < -12.5' --filter-name 'MQRankSum' --filter-expression 'ReadPosRankSum < -8.0' --filter-name 'ReadPosRankSum'"
+    shell:
+        """
+        gatk SelectVariants \
+            -R {input.ref} \
+            -V {input.vcf} \
+            --select-type-to-include SNP \
+            -O temp_snps.vcf.gz
+        
+        gatk VariantFiltration \
+            -R {input.ref} \
+            -V temp_snps.vcf.gz \
+            {params.filter_exp} \
+            -O temp_filtered.vcf.gz
+        
+        bcftools view -f PASS temp_filtered.vcf.gz -Oz -o {output}
+        tabix -p vcf {output}
+        
+        rm temp_snps.vcf.gz temp_snps.vcf.gz.tbi temp_filtered.vcf.gz temp_filtered.vcf.gz.tbi 2>/dev/null || true
+        """
+
+
+rule final_filter_indels:
+    """
+    Final filtering of INDELs
+    """
+    input:
+        vcf = "results/variants/final/{sample}.vcf.gz",
+        ref = "data/reference/reference.fasta"
+    output:
+        "results/variants/final/{sample}.filtered_indels_final.vcf.gz"
+    params:
+        filter_exp = "--filter-expression 'QD < 2.0' --filter-name 'QD' --filter-expression 'FS > 200.0' --filter-name 'FS' --filter-expression 'SOR > 10.0' --filter-name 'SOR'"
+    shell:
+        """
+        gatk SelectVariants \
+            -R {input.ref} \
+            -V {input.vcf} \
+            --select-type-to-include INDEL \
+            -O temp_indels.vcf.gz
+        
+        gatk VariantFiltration \
+            -R {input.ref} \
+            -V temp_indels.vcf.gz \
+            {params.filter_exp} \
+            -O temp_filtered.vcf.gz
+        
+        bcftools view -f PASS temp_filtered.vcf.gz -Oz -o {output}
+        tabix -p vcf {output}
+        
+        rm temp_indels.vcf.gz temp_indels.vcf.gz.tbi temp_filtered.vcf.gz temp_filtered.vcf.gz.tbi 2>/dev/null || true
+        """
+
+
+# ============================================================
+# Variant Annotation
+# ============================================================
+rule variant_effect_predictor:
+    """
+    Annotate variants with VEP (Variant Effect Predictor)
+    Predicts functional consequences on protein-coding genes
+    """
+    input:
+        vcf = "results/variants/final/{sample}.filtered_snps_final.vcf.gz",
+        ref = "data/reference/reference.fasta",
+        gff = "data/reference/reference.gff"
+    output:
+        "results/annotation/{sample}_snps_vep.txt"
+    shell:
+        """
+        vep \
+            -i {input.vcf} \
+            --gff {input.gff} \
+            --fasta {input.ref} \
+            -o {output} \
+            --tab \
+            --force_overwrite --no_stats
+        """
+
+
+# ============================================================
+# Quality Assessment Plots
+# ============================================================
+rule variant_quality_plots:
+    """
+    Generate quality control plots for variant metrics
+    """
+    input:
+        "results/variants/final/{sample}.vcf.gz"
+    output:
+        "results/visualization/{sample}_variant_quality.png"
+    shell:
+        """
+        python workflow/scripts/variant_quality_assessment.py \
+            -i {input} \
+            -o {output}
+        """
+
+
+# ============================================================
+# Summary Report
+# ============================================================
+rule summary_report:
+    """
+    Generate a summary report of the variant calling results
+    """
+    input:
+        snps = "results/variants/final/{sample}.filtered_snps_final.vcf.gz",
+        indels = "results/variants/final/{sample}.filtered_indels_final.vcf.gz"
+    output:
+        "results/visualization/{sample}_summary.txt"
+    shell:
+        """
+        echo "Variant Calling Summary for {wildcards.sample}" > {output}
+        echo "===================================" >> {output}
+        echo "" >> {output}
+        echo "SNPs:" >> {output}
+        bcftools stats {input.snps} | grep "number of SNPs:" >> {output} 2>/dev/null || echo "  SNP stats not available" >> {output}
+        echo "" >> {output}
+        echo "INDELs:" >> {output}
+        bcftools stats {input.indels} | grep "number of indels:" >> {output} 2>/dev/null || echo "  INDEL stats not available" >> {output}
+        echo "" >> {output}
+        echo "Report generated on: $$(date)" >> {output}
+        """
+

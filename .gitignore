@@ -1,0 +1,33 @@
+# Conda environments
+.envs/
+__pycache__/
+
+# Data files (we'll keep small test data)
+data/raw/*
+!data/raw/.gitkeep
+data/reference/*.fai
+
+# Results
+results/*
+
+# Snakemake
+.snakemake/
+benchmarks/
+logs/
+
+# IDE
+.vscode/
+.idea/
+reference_implementation/
+sratoolkit*/
+SRR7801919/
+*.log
+data/raw/*.fastq.gz
+data/reference/*.bt2
+data/reference/*.fai
+data/reference/*.dict
+data/reference/*.gz
+data/reference/*.tbi
+results/
+.snakemake/
+temp_*.vcf.gz*

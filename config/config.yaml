@@ -1,0 +1,42 @@
+# ============================================================
+# SNP-SVant Configuration for Microbial Variant Calling
+# Based on: Gunasekaran et al. (2024) Current Protocols
+# ============================================================
+
+# --- Sample Information ---
+# Path to sample metadata file (tab-separated)
+sample_metadata: "config/samples.tsv"
+
+# --- Reference Genome ---
+reference_genome: "data/reference/reference.fasta"
+reference_gff: "data/reference/reference.gff"
+
+# --- Output Directory ---
+output_dir: "results"
+
+# --- Quality Control Filters (GATK Best Practices) ---
+# These thresholds follow Table 2 from Gunasekaran et al. 2024
+snp_filters:
+  QD: "QD < 2.0"
+  FS: "FS > 60.0"
+  SOR: "SOR > 4.0"
+  MQ: "MQ < 40.0"
+  MQRankSum: "MQRankSum < -12.5"
+  ReadPosRankSum: "ReadPosRankSum < -8.0"
+
+indel_filters:
+  QD: "QD < 2.0"
+  FS: "FS > 200.0"
+  SOR: "SOR > 10.0"
+
+# --- Optional Preprocessing ---
+# Set to true to enable adapter trimming with Trimmomatic
+trim_reads: false
+trimmomatic_params: "ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36"
+
+# --- Computational Resources ---
+threads: 8  # Adjust based on your machine
+
+# --- Sample List (populated from samples.tsv) ---
+samples:
+  - SRR7801919
