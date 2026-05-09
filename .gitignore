@@ -31,3 +31,14 @@ data/reference/*.tbi
 results/
 .snakemake/
 temp_*.vcf.gz*
+*.fasta
+*.fai
+*.dict
+*.bt2
+*.tar.gz
+*.png
+*.backup
+analyze_variants.py
+plot_variants.py
+data/
+results/
