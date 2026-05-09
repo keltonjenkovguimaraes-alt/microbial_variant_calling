@@ -1,4 +1,4 @@
-# Comparison: Our Implementation vs. Gunasekaran et al. (2024)
+# Comparison: This Implementation vs. Gunasekaran et al. (2024)
 
 Reference: Gunasekaran et al. (2024) SNP-SVant. *Current Protocols*, 4, e1046.
 
